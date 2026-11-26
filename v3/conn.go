@@ -98,8 +98,14 @@ type Conn struct {
 	// requestTimeout is loaded atomically
 	// so we need to ensure 64-bit alignment on 32-bit platforms.
 	// https://github.com/go-ldap/ldap/pull/199
-	requestTimeout      int64
+	requestTimeout int64
+	// connMu guards conn, readerBuf and isTLS. StartTLS publishes the
+	// upgraded connection under this lock; all other users snapshot conn
+	// through networkConn instead of reading the interface field directly.
+	connMu              sync.RWMutex
 	conn                net.Conn
+	readerBuf           *bufio.Reader
+	wgReader            sync.WaitGroup
 	isTLS               bool
 	closing             uint32
 	closeErr            atomic.Value
@@ -288,6 +294,7 @@ func DialURL(addr string, opts ...DialOpt) (*Conn, error) {
 func NewConn(conn net.Conn, isTLS bool) *Conn {
 	l := &Conn{
 		conn:            conn,
+		readerBuf:       bufio.NewReader(conn),
 		chanConfirm:     make(chan struct{}),
 		chanMessageID:   make(chan int64),
 		chanMessage:     make(chan *messagePacket, 10),
@@ -305,8 +312,37 @@ func NewConn(conn net.Conn, isTLS bool) *Conn {
 //
 // See: https://github.com/go-ldap/ldap/issues/356
 func (l *Conn) Start() {
-	go l.reader()
+	l.startReader()
 	go l.processMessages()
+}
+
+func (l *Conn) startReader() {
+	l.wgReader.Add(1)
+	go func() {
+		defer l.wgReader.Done()
+		l.reader()
+	}()
+}
+
+func (l *Conn) networkConn() net.Conn {
+	if l == nil {
+		return nil
+	}
+	l.connMu.RLock()
+	defer l.connMu.RUnlock()
+	return l.conn
+}
+
+// bufferedConn lets TLS read bytes that the LDAP reader's bufio.Reader had
+// already pulled from the transport. Without it, a buffered prefix after the
+// final plaintext LDAP packet would be discarded during StartTLS.
+type bufferedConn struct {
+	net.Conn
+	reader *bufio.Reader
+}
+
+func (c *bufferedConn) Read(p []byte) (int, error) {
+	return c.reader.Read(p)
 }
 
 // IsClosing returns whether or not we're currently closing.
@@ -344,7 +380,9 @@ func (l *Conn) Close() (err error) {
 		close(l.chanMessage)
 
 		l.Debug.Printf("Closing network connection")
+		l.connMu.Lock()
 		err = l.conn.Close()
+		l.connMu.Unlock()
 		l.wgClose.Done()
 	}
 	l.wgClose.Wait()
@@ -389,8 +427,17 @@ func (l *Conn) setError(err error) {
 
 // StartTLS sends the command to start a TLS session and then creates a new TLS Client
 func (l *Conn) StartTLS(config *tls.Config) error {
-	if l.isTLS {
+	l.connMu.RLock()
+	alreadyTLS := l.isTLS
+	l.connMu.RUnlock()
+	if alreadyTLS {
 		return NewError(ErrorNetwork, errors.New("ldap: already encrypted"))
+	}
+	if l.IsClosing() {
+		return NewError(ErrorNetwork, errors.New("ldap: connection closed"))
+	}
+	if config == nil {
+		return NewError(ErrorNetwork, errors.New("ldap: TLS configuration cannot be nil"))
 	}
 
 	packet := ber.Encode(ber.ClassUniversal, ber.TypeConstructed, ber.TagSequence, nil, "LDAP Request")
@@ -404,7 +451,16 @@ func (l *Conn) StartTLS(config *tls.Config) error {
 	if err != nil {
 		return err
 	}
-	defer l.finishMessage(msgCtx)
+
+	finishedMessage := false
+	finishMessage := func() {
+		if finishedMessage {
+			return
+		}
+		finishedMessage = true
+		l.finishMessage(msgCtx)
+	}
+	defer finishMessage()
 
 	l.Debug.Printf("%d: waiting for response", msgCtx.id)
 
@@ -427,19 +483,55 @@ func (l *Conn) StartTLS(config *tls.Config) error {
 	}
 
 	if err := GetLDAPError(packet); err == nil {
-		conn := tls.Client(l.conn, config)
+		// The reader marks itself as stopping after this response and exits
+		// before reading again. Wait for it so the old and new readers never
+		// read from the same transport concurrently.
+		l.wgReader.Wait()
 
-		if connErr := conn.Handshake(); connErr != nil {
+		l.connMu.RLock()
+		rawConn := l.conn
+		plaintextReader := l.readerBuf
+		l.connMu.RUnlock()
+		if plaintextReader == nil {
+			plaintextReader = bufio.NewReader(rawConn)
+		}
+
+		tlsConn := tls.Client(&bufferedConn{
+			Conn:   rawConn,
+			reader: plaintextReader,
+		}, config)
+
+		if connErr := tlsConn.Handshake(); connErr != nil {
 			l.Close()
 			return NewError(ErrorNetwork, fmt.Errorf("TLS handshake failed (%v)", connErr))
 		}
 
+		l.connMu.Lock()
+		if l.IsClosing() {
+			l.connMu.Unlock()
+			_ = tlsConn.Close()
+			return NewError(ErrorNetwork, errors.New("ldap: connection closed"))
+		}
 		l.isTLS = true
-		l.conn = conn
+		l.conn = tlsConn
+		l.readerBuf = bufio.NewReader(tlsConn)
+		l.connMu.Unlock()
+
+		// Release the StartTLS exclusion before starting the replacement
+		// reader so it cannot observe isStartingTLS and immediately stop.
+		finishMessage()
+		l.startReader()
 	} else {
+		// The server declined the upgrade. The old reader has stopped at the
+		// response boundary, so wait for it and start a plaintext reader to
+		// preserve the connection's pre-Upgrade usability.
+		l.wgReader.Wait()
+		if !l.IsClosing() {
+			finishMessage()
+			l.startReader()
+		}
 		return err
 	}
-	go l.reader()
 
 	return nil
 }
@@ -448,7 +540,7 @@ func (l *Conn) StartTLS(config *tls.Config) error {
 // The return values are their zero values if StartTLS did
 // not succeed.
 func (l *Conn) TLSConnectionState() (state tls.ConnectionState, ok bool) {
-	tc, ok := l.conn.(*tls.Conn)
+	tc, ok := l.networkConn().(*tls.Conn)
 	if !ok {
 		return
 	}
@@ -510,16 +602,14 @@ func (l *Conn) sendMessageWithFlags(packet *ber.Packet, flags sendMessageFlags) 
 func (l *Conn) finishMessage(msgCtx *messageContext) {
 	close(msgCtx.done)
 
+	l.messageMutex.Lock()
+	l.outstandingRequests--
+	l.isStartingTLS = false
+	l.messageMutex.Unlock()
+
 	if l.IsClosing() {
 		return
 	}
-
-	l.messageMutex.Lock()
-	l.outstandingRequests--
-	if l.isStartingTLS {
-		l.isStartingTLS = false
-	}
-	l.messageMutex.Unlock()
 
 	message := &messagePacket{
 		Op:        MessageFinish,
@@ -572,7 +662,13 @@ func (l *Conn) processMessages() {
 				l.Debug.Printf("Sending message %d", message.MessageID)
 
 				buf := message.Packet.Bytes()
-				_, err := l.conn.Write(buf)
+				networkConn := l.networkConn()
+				var err error
+				if networkConn == nil {
+					err = ErrNilConnection
+				} else {
+					_, err = networkConn.Write(buf)
+				}
 				if err != nil {
 					l.Debug.Printf("Error Sending Message: %s", err.Error())
 					message.Context.sendResponse(&PacketResponse{Error: fmt.Errorf("unable to send request: %s", err)}, time.Duration(l.getTimeout()))
@@ -647,7 +743,12 @@ func (l *Conn) reader() {
 		}
 	}()
 
-	bufConn := bufio.NewReader(l.conn)
+	l.connMu.RLock()
+	bufConn := l.readerBuf
+	l.connMu.RUnlock()
+	if bufConn == nil {
+		bufConn = bufio.NewReader(l.networkConn())
+	}
 	for {
 		if cleanstop {
 			l.Debug.Printf("reader clean stopping (without closing the connection)")
